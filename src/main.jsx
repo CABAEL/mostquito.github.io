@@ -4,7 +4,7 @@ import './index.css'
 import MosquitoApp from './MosquitoShooter.jsx'
 
 createRoot(document.getElementById('root')).render(
-  <StrictMode>
-   <MosquitoApp/>
-  </StrictMode>,
+
+  <MosquitoApp/>
+
 )
