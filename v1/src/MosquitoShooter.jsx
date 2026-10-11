@@ -23,6 +23,54 @@ const START_SPAWN_MS = 3200;   // gap between new mosquitoes at the start...
 const MIN_SPAWN_MS = 800;      // ...shrinking down to this
 const SPAWN_RAMP = 40;         // ms shaved off the gap per second played
 
+// Camera "steps back" from the lamp before the game and steps forward when it starts.
+const IDLE_ZOOM = 0.5;         // lamp + swarm scale before the game starts and on the results screen
+const PLAY_ZOOM = 1;           // lamp + swarm scale while playing
+const WALL_ZOOM_IDLE = 1;      // wall scale while stepped back (keep >= 1 so it always covers the screen)
+const WALL_ZOOM_PLAY = 1.12;   // wall scale while playing: a slight push-in so the wall feels closer too (1 = off)
+const ZOOM_ORIGIN_X = 0.5;     // the lamp hangs from the top centre, so the camera pulls back from there
+const ZOOM_ORIGIN_Y = 0;
+const ZOOM_MS = 1100;          // how long the step back / step forward takes
+const ZOOM_EASE = 'cubic-bezier(0.22, 0.8, 0.2, 1)';
+
+// Total average rating (weights add up to 100)
+const W_ACCURACY = 30;         // hits / shots
+const W_SPEED = 25;            // average reaction time
+const W_QUICK = 10;            // best single reaction
+const W_KILLS = 20;            // kill rate: share of the mosquitoes that appeared that you shot
+const W_ENDURANCE = 15;        // how long you lasted
+const AVG_RT_FULL = 600;       // ms, average reaction that earns full speed points...
+const AVG_RT_ZERO = 4000;      // ...and the one that earns none
+const BEST_RT_FULL = 300;      // ms, best reaction that earns full quick-draw points...
+const BEST_RT_ZERO = 2000;    // ...and the one that earns none
+const KILL_RATE_FOR_FULL = 0.85; // share of spawned mosquitoes shot that earns full kill points (a few are always still alive)
+const SECONDS_FOR_FULL = 90;   // Endless mode: seconds played for full endurance points (timed modes use their own limit)
+
+// Sample sizes: with too little data the rating is scaled down instead of trusting a lucky streak.
+// Needs scale with how many mosquitoes actually appeared, so short custom rounds are not punished.
+const SAMPLE_SHOTS = 8;        // shots needed for a full rating (at most)...
+const MIN_SAMPLE_SHOTS = 3;    // ...but never more than this when only a few mosquitoes appeared
+const SAMPLE_SHOT_SHARE = 0.5; // shots needed as a share of mosquitoes spawned
+const SAMPLE_HITS = 5;         // hits needed before the two reaction scores count in full (at most)...
+const MIN_SAMPLE_HITS = 2;     // ...but never more than this when only a few mosquitoes appeared
+const SAMPLE_HIT_SHARE = 0.4;  // hits needed as a share of mosquitoes spawned
+const MIN_ROUND_SECONDS = 30;  // rounds shorter than this (or than the time limit, if lower) are scaled down
+
+// Game modes: pick a time limit before the round starts, or play Endless (no time limit)
+const MODE_MINUTES = [1, 2, 3, 4, 5]; // preset time limits, in minutes
+const CUSTOM_MIN_SEC = 10;            // custom time limit bounds, in seconds
+const CUSTOM_MAX_SEC = 3600;
+const CUSTOM_DEFAULT_SEC = 45;
+
+const RANKS = [
+  { min: 90, grade: 'S', title: 'Apex swatter' },
+  { min: 80, grade: 'A', title: 'Sharpshooter' },
+  { min: 65, grade: 'B', title: 'Steady hand' },
+  { min: 50, grade: 'C', title: 'Warming up' },
+  { min: 30, grade: 'D', title: 'Itchy skin' },
+  { min: 0, grade: 'E', title: 'Free buffet' },
+];
+
 // Gray palette
 const G_BG = 'rgba(28,28,28,0.86)';
 const G_LINE = 'rgba(255,255,255,0.14)';
@@ -49,12 +97,80 @@ const CROSSHAIR_CURSOR = (() => {
 const fmtMs = (ms) =>
   ms == null ? '–' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 const fmtTime = (ms) => `${(ms / 1000).toFixed(1)} s`;
+// m:ss countdown clock
+const fmtClock = (ms) => {
+  const t = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+};
+// "2 min", "45 s", "1 min 30 s"
+const fmtLimit = (sec) =>
+  sec < 60 ? `${sec} s` : sec % 60 === 0 ? `${sec / 60} min` : `${Math.floor(sec / 60)} min ${sec % 60} s`;
+const clampCustom = (v) =>
+  Math.max(CUSTOM_MIN_SEC, Math.min(CUSTOM_MAX_SEC, parseInt(v, 10) || CUSTOM_DEFAULT_SEC));
+
+// 1 at `full`, 0 at `zero`, linear in between (lower ms = better)
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+const lowerIsBetter = (v, full, zero) => (v == null ? 0 : clamp01((zero - v) / (zero - full)));
+
+// Average reaction used for scoring: each reaction counts at most AVG_RT_ZERO (a score of zero anyway),
+// so a single long pause cannot wreck an otherwise fast round. The plain average is still what is shown.
+const cappedMean = (list) =>
+  list.length ? list.reduce((sum, r) => sum + Math.min(r, AVG_RT_ZERO), 0) / list.length : null;
+
+// Total average: weighted mix of every scoring aspect, 0 to 100.
+//   Accuracy     hits / shots
+//   Avg / best   reaction scores, trusted only as far as there are enough hits behind them
+//   Kill rate    hits / mosquitoes spawned, so it is fair in 1-minute, 5-minute and Endless rounds alike
+//   Endurance    time played / time limit (timed modes) or / SECONDS_FOR_FULL (Endless)
+// The total is then scaled down for rounds too short (in shots or seconds) to say anything reliable.
+const computeRating = ({ shots, hits, spawned = 0, avg, best, durationMs, fullSeconds }) => {
+  const secs = durationMs / 1000;
+  const needHits = Math.min(SAMPLE_HITS, Math.max(MIN_SAMPLE_HITS, Math.ceil(spawned * SAMPLE_HIT_SHARE)));
+  const hitConf = clamp01(hits / needHits);
+  const parts = [
+    { key: 'accuracy', label: 'Accuracy', weight: W_ACCURACY, score: shots ? hits / shots : 0 },
+    { key: 'speed', label: 'Average reaction', weight: W_SPEED, score: lowerIsBetter(avg, AVG_RT_FULL, AVG_RT_ZERO) * hitConf },
+    { key: 'quick', label: 'Best reaction', weight: W_QUICK, score: lowerIsBetter(best, BEST_RT_FULL, BEST_RT_ZERO) * hitConf },
+    { key: 'kills', label: 'Kill rate', weight: W_KILLS, score: spawned > 0 ? clamp01(hits / spawned / KILL_RATE_FOR_FULL) : 0 },
+    { key: 'endurance', label: 'Time survived', weight: W_ENDURANCE, score: clamp01(secs / (fullSeconds || SECONDS_FOR_FULL)) },
+  ];
+
+  const needShots = Math.min(SAMPLE_SHOTS, Math.max(MIN_SAMPLE_SHOTS, Math.ceil(spawned * SAMPLE_SHOT_SHARE)));
+  const needSecs = Math.min(MIN_ROUND_SECONDS, fullSeconds || MIN_ROUND_SECONDS);
+  const shotConf = clamp01(shots / needShots);
+  const timeConf = clamp01(secs / needSecs);
+  const confidence = Math.min(shotConf, timeConf);
+
+  let note = null;
+  if (confidence < 1) {
+    note =
+      shotConf <= timeConf
+        ? `Fire at least ${needShots} shots for a full rating. Short rounds are scaled down.`
+        : `Play at least ${Math.round(needSecs)} s for a full rating. Short rounds are scaled down.`;
+  } else if (hitConf < 1) {
+    note = `Hit at least ${needHits} mosquitoes for full credit on your reaction scores.`;
+  }
+
+  const raw = parts.reduce((sum, p) => sum + p.score * p.weight, 0);
+  const total = Math.round(raw * confidence);
+  const rank = RANKS.find((r) => total >= r.min);
+  return {
+    total,
+    confidence,
+    note,
+    grade: rank.grade,
+    title: rank.title,
+    parts: parts.map((p) => ({ ...p, pct: Math.round(p.score * 100) })),
+  };
+};
 
 const styles = `
 .ms-root { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; touch-action: none; overscroll-behavior: none; }
 .ms-root [data-ui] { cursor: default; }
 .ms-root button { cursor: pointer; font-family: inherit; }
-.ms-root button:focus-visible { outline: 2px solid #ffffff; outline-offset: 2px; }
+.ms-root input { -webkit-user-select: text; user-select: text; touch-action: manipulation; font-family: inherit; }
+.ms-root button:focus-visible, .ms-root select:focus-visible { outline: 2px solid #ffffff; outline-offset: 2px; }
+.ms-root select { touch-action: manipulation; font-family: inherit; }
 
 @keyframes ms-swing  { 0% { transform: rotate(-2.5deg); } 50% { transform: rotate(2.5deg); } 100% { transform: rotate(-2.5deg); } }
 @keyframes ms-buzz   { 0% { transform: translate(0,0); } 25% { transform: translate(1px,-1px); } 50% { transform: translate(-1px,1px); } 75% { transform: translate(1px,1px); } 100% { transform: translate(0,0); } }
@@ -63,6 +179,7 @@ const styles = `
 @keyframes ms-rise   { from { transform: translateY(14px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 @keyframes ms-glow   { 0% { transform: scale(1); opacity: .92; } 50% { transform: scale(1.05); opacity: 1; } 100% { transform: scale(1); opacity: .92; } }
 @keyframes ms-strain { 0% { transform: translate(0,0); } 25% { transform: translate(-2px,1px); } 50% { transform: translate(2px,-1px); } 75% { transform: translate(-1px,-2px); } 100% { transform: translate(0,0); } }
+@keyframes ms-grow   { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 
 .ms-swing  { animation: ms-swing 4s ease-in-out infinite; transform-origin: top center; }
 .ms-buzz   { animation: ms-buzz .09s linear infinite; }
@@ -70,15 +187,18 @@ const styles = `
 .ms-strain { animation: ms-strain .14s linear infinite; }
 .ms-btn:hover { filter: brightness(1.2); }
 .ms-halo   { animation: ms-glow 5s ease-in-out infinite; }
+.ms-grow   { animation: ms-grow .7s cubic-bezier(.16,1,.3,1) both; transform-origin: left center; }
 
 @media (prefers-reduced-motion: reduce) {
-  .ms-swing, .ms-buzz, .ms-modal, .ms-strain, .ms-halo { animation: none; }
+  .ms-swing, .ms-buzz, .ms-modal, .ms-strain, .ms-halo, .ms-grow { animation: none; }
+  .ms-camera, .ms-wall { transition: none !important; }
 }
 `;
 
 // ─── Component ───────────────────────────────────────────────────────────────
 const MosquitoShooter = ({ fullscreen = true }) => {
   const boxRef = useRef(null);
+  const camRef = useRef(null);
   const lightRef = useRef(null);
 
   const mosqs = useRef(new Map());
@@ -87,6 +207,8 @@ const MosquitoShooter = ({ fullscreen = true }) => {
 
   const startRef = useRef(null);
   const hitsRef = useRef(0);
+  const spawnedRef = useRef(0); // mosquitoes that have appeared this round (the kill rate is measured against this)
+  const lastHitRef = useRef(0); // when the previous mosquito was shot: the next reaction is timed from here
   const phaseRef = useRef('idle');
   const audioRef = useRef(null);
 
@@ -100,6 +222,8 @@ const MosquitoShooter = ({ fullscreen = true }) => {
   const [flashes, setFlashes] = useState([]);
   const [popups, setPopups] = useState([]);
   const [muted, setMuted] = useState(false);
+  const [mode, setMode] = useState('endless'); // 'endless' | '1'..'5' (minutes) | 'custom'
+  const [customSec, setCustomSec] = useState(String(CUSTOM_DEFAULT_SEC));
   const [narrow, setNarrow] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 640px)').matches
   );
@@ -121,6 +245,12 @@ const MosquitoShooter = ({ fullscreen = true }) => {
   }, []);
 
   phaseRef.current = phase;
+
+  // Time limit for this round (null = Endless)
+  const limitSec =
+    mode === 'endless' ? null : mode === 'custom' ? clampCustom(customSec) : Number(mode) * 60;
+  const limitMs = limitSec == null ? null : limitSec * 1000;
+  const modeLabel = limitSec == null ? 'Endless' : fmtLimit(limitSec);
 
   // ── Buzz sound ─────────────────────────────────────────────────────────────
   const startBuzz = () => {
@@ -193,20 +323,36 @@ const MosquitoShooter = ({ fullscreen = true }) => {
     return { x: w / 2 + (BULB_X - 0.5) * LIGHT_WIDTH, y: lh > 40 ? el.offsetTop + lh * BULB_Y : 210 };
   }, []);
 
+  // Current on-screen scale of the camera layer (follows the CSS transition, so it is right mid-zoom)
+  const getCamScale = useCallback(() => {
+    const cam = camRef.current;
+    const laidOut = cam ? cam.offsetWidth : 0;
+    if (!laidOut) return 1;
+    const s = cam.getBoundingClientRect().width / laidOut;
+    return s > 0.01 ? s : 1;
+  }, []);
+
   const spawnMosquito = useCallback(() => {
     const box = boxRef.current;
     if (!box) return;
     const w = box.clientWidth;
     const h = box.clientHeight;
     const id = ++nextId.current;
+    spawnedRef.current += 1;
     const fromLeft = Math.random() < 0.5;
+    // Spawn just past the screen edge, even when the camera is stepped back
+    const s = getCamScale();
+    const ox = w * ZOOM_ORIGIN_X;
+    const leftX = ox - (ox + 40) / s;
+    const rightX = ox + (w - ox + 40) / s;
     mosqs.current.set(id, {
       id,
-      x: fromLeft ? -40 : w + 40,
+      x: fromLeft ? leftX : rightX,
       y: h * (0.25 + Math.random() * 0.55),
       vx: 0, vy: 0,
       alive: true,
       spawnedAt: performance.now(),
+      visibleAt: 0, // set once it has flown onto the screen
       deadAt: 0, fallV: 0, rot: 0, opacity: 1,
       ang: Math.random() * Math.PI * 2,
       omega: (0.8 + Math.random() * 0.7) * (Math.random() < 0.5 ? -1 : 1),
@@ -217,7 +363,7 @@ const MosquitoShooter = ({ fullscreen = true }) => {
       seed: Math.random() * 100,
     });
     syncSwarm();
-  }, [syncSwarm]);
+  }, [syncSwarm, getCamScale]);
 
   // ── Flight loop ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -255,6 +401,7 @@ const MosquitoShooter = ({ fullscreen = true }) => {
           py = Math.max(30, Math.min(h - 110, py));
 
           const offscreen = m.x < 0 || m.x > w;
+          if (!offscreen && !m.visibleAt) m.visibleAt = now;
           const dx = px - m.x;
           const dy = py - m.y;
           const dist = Math.hypot(dx, dy) || 1;
@@ -326,25 +473,56 @@ const MosquitoShooter = ({ fullscreen = true }) => {
     return () => clearInterval(id);
   }, [phase]);
 
+  // ── Time limit (timed modes) ───────────────────────────────────────────────
+  useEffect(() => {
+    if (phase !== 'playing' || limitMs == null) return undefined;
+    const remaining = Math.max(0, limitMs - (performance.now() - startRef.current));
+    const t = setTimeout(() => {
+      setDurationMs(limitMs);
+      setEndReason('timeup');
+      setPhase('finished');
+    }, remaining);
+    return () => clearTimeout(t);
+  }, [phase, limitMs]);
+
   const roundOver = phase === 'crashed' || phase === 'finished';
+
+  // The camera is stepped back until the player starts, then steps forward to 1x.
+  // It steps back again behind the results card.
+  const zoomedIn = phase === 'playing' || phase === 'crashed';
+  const zoom = zoomedIn ? PLAY_ZOOM : IDLE_ZOOM;
+  const wallZoom = zoomedIn ? WALL_ZOOM_PLAY : WALL_ZOOM_IDLE;
+
+  // The lamp + swarm layer is scaled around its origin, so convert a screen point
+  // back into the scene's own coordinates (this also stays correct mid-zoom).
+  const toScenePoint = (clientX, clientY) => {
+    const rect = boxRef.current.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const scale = getCamScale();
+    const ox = rect.width * ZOOM_ORIGIN_X;
+    const oy = rect.height * ZOOM_ORIGIN_Y;
+    return { x: ox + (px - ox) / scale, y: oy + (py - oy) / scale };
+  };
 
   // ── Shooting ───────────────────────────────────────────────────────────────
   const handlePointerDown = (e) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (roundOver || e.target.closest('[data-ui]')) return;
 
-    const rect = boxRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
     const now = performance.now();
-    const isFirstClick = phase === 'idle';
-    if (isFirstClick) {
+
+    // First click only starts the round (and zooms in); it doesn't count as a shot.
+    if (phase === 'idle') {
       startRef.current = now;
+      lastHitRef.current = now;
       startBuzz();
       setElapsed(0);
       setPhase('playing');
+      return;
     }
+
+    const { x, y } = toScenePoint(e.clientX, e.clientY);
 
     const radius = e.pointerType === 'touch' ? HIT_RADIUS_TOUCH : HIT_RADIUS;
     let target = null;
@@ -362,7 +540,11 @@ const MosquitoShooter = ({ fullscreen = true }) => {
     let reaction = null;
 
     if (hit) {
-      reaction = now - (isFirstClick ? target.spawnedAt : Math.max(target.spawnedAt, startRef.current));
+      // Reaction = how long it took to get this mosquito once you could: counted from the latest of
+      // the round start, the previous kill, and the moment it appeared on screen. (Measuring from
+      // spawn punished mosquitoes that simply circled for a while and pushed the average to zero.)
+      reaction = now - Math.max(target.visibleAt || target.spawnedAt, lastHitRef.current, startRef.current);
+      lastHitRef.current = now;
       target.alive = false;
       target.deadAt = now;
       target.fallV = -140;
@@ -400,6 +582,8 @@ const MosquitoShooter = ({ fullscreen = true }) => {
   const playAgain = () => {
     startRef.current = null;
     hitsRef.current = 0;
+    lastHitRef.current = 0;
+    spawnedRef.current = 0;
     mosqs.current.clear();
     setStats({ shots: 0, hits: 0, reactions: [] });
     setElapsed(0);
@@ -418,14 +602,30 @@ const MosquitoShooter = ({ fullscreen = true }) => {
       accuracy: shots ? Math.round((hits / shots) * 100) : 0,
       avg: reactions.length ? reactions.reduce((a, b) => a + b, 0) / reactions.length : null,
       best: reactions.length ? Math.min(...reactions) : null,
+      scoreAvg: cappedMean(reactions),
     };
   }, [stats]);
+
+  // Final total average (shown on the results card and the downloaded image)
+  const rating = useMemo(
+    () =>
+      computeRating({
+        shots: summary.shots,
+        hits: summary.hits,
+        spawned: spawnedRef.current,
+        avg: summary.scoreAvg,
+        best: summary.best,
+        durationMs,
+        fullSeconds: limitSec,
+      }),
+    [summary, durationMs, limitSec, phase]
+  );
 
   // ── Download Stats as Image ───────────────────────────────────────────────
   const downloadStatsImage = () => {
     const canvas = document.createElement('canvas');
     canvas.width = 600;
-    canvas.height = 500;
+    canvas.height = 740;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
@@ -457,6 +657,40 @@ const MosquitoShooter = ({ fullscreen = true }) => {
       90
     );
 
+    // Game mode
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#666666';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(`Mode: ${modeLabel}`, 560, 90);
+    ctx.textAlign = 'left';
+
+    // Total average block
+    ctx.fillStyle = '#1f1f1f';
+    ctx.beginPath();
+    ctx.roundRect(40, 115, 520, 110, 14);
+    ctx.fill();
+
+    ctx.fillStyle = '#9b9b9b';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('Total average', 64, 147);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 60px sans-serif';
+    ctx.fillText(String(rating.total), 64, 205);
+    const scoreW = ctx.measureText(String(rating.total)).width;
+    ctx.fillStyle = '#9b9b9b';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText('/ 100', 64 + scoreW + 10, 205);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 56px sans-serif';
+    ctx.fillText(rating.grade, 536, 175);
+    ctx.fillStyle = '#d0d0d0';
+    ctx.font = '15px sans-serif';
+    ctx.fillText(rating.title, 536, 203);
+    ctx.textAlign = 'left';
+
     // Stats Grid Cells
     const cells = [
       { label: 'Hits', value: summary.hits },
@@ -468,7 +702,7 @@ const MosquitoShooter = ({ fullscreen = true }) => {
     ];
 
     const startX = 40;
-    const startY = 130;
+    const startY = 250;
     const cellW = 245;
     const cellH = 75;
     const gapX = 30;
@@ -494,10 +728,36 @@ const MosquitoShooter = ({ fullscreen = true }) => {
       ctx.fillText(cell.label, x + 18, y + 58);
     });
 
+    // Score breakdown bars
+    rating.parts.forEach((p, i) => {
+      const y = 535 + i * 30;
+      ctx.fillStyle = '#444444';
+      ctx.font = '13px sans-serif';
+      ctx.fillText(`${p.label} (${p.weight}% of total)`, 40, y);
+
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#1f1f1f';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillText(String(p.pct), 560, y);
+      ctx.textAlign = 'left';
+
+      ctx.fillStyle = 'rgba(0,0,0,0.1)';
+      ctx.beginPath();
+      ctx.roundRect(40, y + 8, 520, 8, 4);
+      ctx.fill();
+
+      if (p.pct > 0) {
+        ctx.fillStyle = '#1f1f1f';
+        ctx.beginPath();
+        ctx.roundRect(40, y + 8, Math.max(8, 520 * p.score), 8, 4);
+        ctx.fill();
+      }
+    });
+
     // Watermark / Branding
     ctx.fillStyle = '#9b9b9b';
     ctx.font = '12px sans-serif';
-    ctx.fillText('Most-quito Shooter Game', 40, 460);
+    ctx.fillText('Most-quito Shooter Game', 40, 715);
 
     // Trigger Download
     const link = document.createElement('a');
@@ -510,6 +770,10 @@ const MosquitoShooter = ({ fullscreen = true }) => {
   const liveAcc = stats.shots ? Math.round((stats.hits / stats.shots) * 100) : 0;
   const liveAvg = stats.reactions.length
     ? stats.reactions.reduce((a, b) => a + b, 0) / stats.reactions.length
+    : null;
+  const liveBest = stats.reactions.length ? Math.min(...stats.reactions) : null;
+  const liveRating = playing
+    ? computeRating({ shots: stats.shots, hits: stats.hits, spawned: spawnedRef.current, avg: cappedMean(stats.reactions), best: liveBest, durationMs: elapsed, fullSeconds: limitSec })
     : null;
   const strained = playing && aliveCount >= STRAIN_AT;
 
@@ -532,137 +796,167 @@ const MosquitoShooter = ({ fullscreen = true }) => {
     >
       <style>{styles}</style>
 
-      {/* Wall Background */}
+      {/* Wall Background: always fills the whole screen. The outer layer does the
+          slow push-in, the inner one does the strain shake. */}
       <div
-        className={strained ? 'ms-strain' : undefined}
+        className="ms-wall"
         style={{
           position: 'absolute',
-          inset: -6,
-          backgroundImage: `url(${wallImg})`,
-          backgroundSize: 'cover',
-          backgroundPosition: 'center',
+          inset: 0,
+          transform: `scale(${wallZoom})`,
+          transformOrigin: `${ZOOM_ORIGIN_X * 100}% ${ZOOM_ORIGIN_Y * 100}%`,
+          transition: `transform ${ZOOM_MS}ms ${ZOOM_EASE}`,
+          willChange: 'transform',
           pointerEvents: 'none',
           zIndex: 0,
         }}
-      />
-
-      {/* Hanging Lamp */}
-      <div
-        ref={lightRef}
-        className="ms-swing"
-        style={{
-          position: 'absolute',
-          top: LIGHT_TOP,
-          left: '50%',
-          marginLeft: -LIGHT_WIDTH / 2,
-          width: LIGHT_WIDTH,
-          pointerEvents: 'none',
-          zIndex: 2,
-        }}
       >
         <div
-          className="ms-halo"
+          className={strained ? 'ms-strain' : undefined}
           style={{
             position: 'absolute',
-            left: `${BULB_X * 100}%`,
-            top: `${BULB_Y * 100}%`,
-            width: HALO_SIZE,
-            height: HALO_SIZE,
-            marginLeft: -HALO_SIZE / 2,
-            marginTop: -HALO_SIZE / 2,
-            borderRadius: '50%',
-            background:
-              'radial-gradient(circle, rgba(255,251,232,0.9) 0%, rgba(255,238,176,0.6) 10%, rgba(255,224,135,0.32) 28%, rgba(255,210,110,0.12) 50%, rgba(255,210,110,0) 70%)',
-            pointerEvents: 'none',
-          }}
-        />
-        <img
-          src={lightImg}
-          alt="Hanging lamp"
-          draggable={false}
-          style={{
-            position: 'relative',
-            zIndex: 1,
-            display: 'block',
-            width: '100%',
-            borderTop: '5px solid #333333',
-            pointerEvents: 'none',
+            inset: -6,
+            backgroundImage: `url(${wallImg})`,
+            backgroundSize: 'cover',
+            backgroundPosition: 'center',
           }}
         />
       </div>
 
-      {/* Swarm */}
-      {ids.map((id) => (
+      {/* Camera: the lamp and the swarm shrink toward the ceiling when stepped back
+          and grow to full size when the game starts */}
+      <div
+        ref={camRef}
+        className="ms-camera"
+        style={{
+          position: 'absolute',
+          inset: 0,
+          transform: `scale(${zoom})`,
+          transformOrigin: `${ZOOM_ORIGIN_X * 100}% ${ZOOM_ORIGIN_Y * 100}%`,
+          transition: `transform ${ZOOM_MS}ms ${ZOOM_EASE}`,
+          willChange: 'transform',
+          pointerEvents: 'none',
+          zIndex: 1,
+        }}
+      >
+        {/* Hanging Lamp */}
         <div
-          key={id}
-          ref={(el) => {
-            if (el) mosqEls.current.set(id, el);
-            else mosqEls.current.delete(id);
-          }}
+          ref={lightRef}
+          className="ms-swing"
           style={{
             position: 'absolute',
-            left: 0,
-            top: 0,
-            width: MOSQUITO_SIZE,
-            height: MOSQUITO_SIZE,
-            transform: 'translate3d(-200px, -200px, 0)',
-            zIndex: 3,
+            top: LIGHT_TOP,
+            left: '50%',
+            marginLeft: -LIGHT_WIDTH / 2,
+            width: LIGHT_WIDTH,
             pointerEvents: 'none',
-            willChange: 'transform, opacity',
-            filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))',
+            zIndex: 2,
           }}
         >
+          <div
+            className="ms-halo"
+            style={{
+              position: 'absolute',
+              left: `${BULB_X * 100}%`,
+              top: `${BULB_Y * 100}%`,
+              width: HALO_SIZE,
+              height: HALO_SIZE,
+              marginLeft: -HALO_SIZE / 2,
+              marginTop: -HALO_SIZE / 2,
+              borderRadius: '50%',
+              background:
+                'radial-gradient(circle, rgba(255,251,232,0.9) 0%, rgba(255,238,176,0.6) 10%, rgba(255,224,135,0.32) 28%, rgba(255,210,110,0.12) 50%, rgba(255,210,110,0) 70%)',
+              pointerEvents: 'none',
+            }}
+          />
           <img
-            className="ms-buzz"
-            src={mosquitoImg}
-            alt="Mosquito"
+            src={lightImg}
+            alt="Hanging lamp"
             draggable={false}
-            style={{ width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
+            style={{
+              position: 'relative',
+              zIndex: 1,
+              display: 'block',
+              width: '100%',
+              borderTop: '5px solid #333333',
+              pointerEvents: 'none',
+            }}
           />
         </div>
-      ))}
 
-      {/* Muzzle Flashes */}
-      {flashes.map((f) => (
-        <div
-          key={f.id}
-          style={{
-            position: 'absolute',
-            left: f.x,
-            top: f.y,
-            width: 36,
-            height: 36,
-            borderRadius: '50%',
-            background: 'radial-gradient(circle, #ffffff 15%, #c4c4c4 45%, #6e6e6e 70%, rgba(110,110,110,0) 100%)',
-            boxShadow: '0 0 22px rgba(255,255,255,0.8), 0 0 8px #ffffff',
-            animation: 'ms-flash .22s ease-out forwards',
-            pointerEvents: 'none',
-            zIndex: 8,
-          }}
-        />
-      ))}
+        {/* Swarm */}
+        {ids.map((id) => (
+          <div
+            key={id}
+            ref={(el) => {
+              if (el) mosqEls.current.set(id, el);
+              else mosqEls.current.delete(id);
+            }}
+            style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              width: MOSQUITO_SIZE,
+              height: MOSQUITO_SIZE,
+              transform: 'translate3d(-200px, -200px, 0)',
+              zIndex: 3,
+              pointerEvents: 'none',
+              willChange: 'transform, opacity',
+              filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))',
+            }}
+          >
+            <img
+              className="ms-buzz"
+              src={mosquitoImg}
+              alt="Mosquito"
+              draggable={false}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none' }}
+            />
+          </div>
+        ))}
 
-      {/* Hit / Miss Popups */}
-      {popups.map((p) => (
-        <div
-          key={p.id}
-          style={{
-            position: 'absolute',
-            left: p.x,
-            top: p.y,
-            fontSize: p.hit ? 18 : 14,
-            fontWeight: 700,
-            color: p.hit ? '#ffffff' : G_MUTED,
-            textShadow: '0 1px 6px rgba(0,0,0,0.85)',
-            whiteSpace: 'pre',
-            animation: 'ms-pop .85s ease-out forwards',
-            pointerEvents: 'none',
-            zIndex: 9,
-          }}
-        >
-          {p.text}
-        </div>
-      ))}
+        {/* Muzzle Flashes */}
+        {flashes.map((f) => (
+          <div
+            key={f.id}
+            style={{
+              position: 'absolute',
+              left: f.x,
+              top: f.y,
+              width: 36,
+              height: 36,
+              borderRadius: '50%',
+              background: 'radial-gradient(circle, #ffffff 15%, #c4c4c4 45%, #6e6e6e 70%, rgba(110,110,110,0) 100%)',
+              boxShadow: '0 0 22px rgba(255,255,255,0.8), 0 0 8px #ffffff',
+              animation: 'ms-flash .22s ease-out forwards',
+              pointerEvents: 'none',
+              zIndex: 8,
+            }}
+          />
+        ))}
+
+        {/* Hit / Miss Popups */}
+        {popups.map((p) => (
+          <div
+            key={p.id}
+            style={{
+              position: 'absolute',
+              left: p.x,
+              top: p.y,
+              fontSize: p.hit ? 18 : 14,
+              fontWeight: 700,
+              color: p.hit ? '#ffffff' : G_MUTED,
+              textShadow: '0 1px 6px rgba(0,0,0,0.85)',
+              whiteSpace: 'pre',
+              animation: 'ms-pop .85s ease-out forwards',
+              pointerEvents: 'none',
+              zIndex: 9,
+            }}
+          >
+            {p.text}
+          </div>
+        ))}
+      </div>
 
       {/* Mute Button */}
       {!roundOver && (
@@ -707,7 +1001,7 @@ const MosquitoShooter = ({ fullscreen = true }) => {
         </button>
       )}
 
-      {/* Start Hint */}
+      {/* Idle: pick a game mode, then click anywhere to start */}
       {phase === 'idle' && (
         <div
           style={{
@@ -715,17 +1009,33 @@ const MosquitoShooter = ({ fullscreen = true }) => {
             left: 0,
             right: 0,
             bottom: 'calc(28px + env(safe-area-inset-bottom, 0px))',
-            textAlign: 'center',
-            padding: '0 16px',
-            fontSize: '0.8rem',
-            letterSpacing: '0.05em',
-            color: 'rgba(255,255,255,0.7)',
-            textShadow: '0 1px 6px rgba(0,0,0,0.8)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: narrow ? 12 : 16,
             pointerEvents: 'none',
-            zIndex: 5,
+            zIndex: 30,
           }}
         >
-          {coarse ? 'Tap' : 'Click'} anywhere to start. Shoot the mosquitoes before they crash your browser.
+          <ModePicker
+            mode={mode}
+            onMode={setMode}
+            customSec={customSec}
+            onCustomSec={setCustomSec}
+            narrow={narrow}
+          />
+          <div
+            style={{
+              textAlign: 'center',
+              padding: '0 16px',
+              fontSize: '0.8rem',
+              letterSpacing: '0.05em',
+              color: 'rgba(255,255,255,0.7)',
+              textShadow: '0 1px 6px rgba(0,0,0,0.8)',
+            }}
+          >
+            {coarse ? 'Tap' : 'Click'} anywhere to start. Shoot the mosquitoes before they crash your browser.
+          </div>
         </div>
       )}
 
@@ -754,11 +1064,16 @@ const MosquitoShooter = ({ fullscreen = true }) => {
             zIndex: 30,
           }}
         >
-          <Stat label="Time" value={fmtTime(elapsed)} />
+          {limitMs == null ? (
+            <Stat label="Time" value={fmtTime(elapsed)} />
+          ) : (
+            <Stat label="Time left" value={fmtClock(limitMs - elapsed)} />
+          )}
           <Stat label="Shots" value={stats.shots} />
           <Stat label="Hits" value={stats.hits} />
           <Stat label="Accuracy" value={`${liveAcc}%`} />
           {!narrow && <Stat label="Avg reaction" value={fmtMs(liveAvg)} />}
+          {!narrow && liveRating && <Stat label="Rating" value={`${liveRating.total} ${liveRating.grade}`} />}
           <Meter label="Browser load" value={aliveCount} max={MAX_MOSQUITOES} />
           <button
             type="button"
@@ -823,7 +1138,7 @@ const MosquitoShooter = ({ fullscreen = true }) => {
         </div>
       )}
 
-      {/* Results Modal */}
+      {/* Results Modal: wide two-column card so everything fits without scrolling */}
       {phase === 'finished' && (
         <div
           data-ui
@@ -831,7 +1146,7 @@ const MosquitoShooter = ({ fullscreen = true }) => {
             position: 'absolute',
             inset: 0,
             display: 'flex',
-            padding: 16,
+            padding: narrow ? 10 : 16,
             overflowY: 'auto',
             background: 'rgba(20,20,20,0.7)',
             backdropFilter: 'blur(4px)',
@@ -845,99 +1160,129 @@ const MosquitoShooter = ({ fullscreen = true }) => {
             aria-label="Your results"
             style={{
               width: '100%',
-              maxWidth: 460,
+              maxWidth: narrow ? 460 : 880,
               margin: 'auto',
-              padding: narrow ? 20 : 26,
+              padding: narrow ? 16 : 24,
               borderRadius: 16,
               background: G_CARD,
               color: G_INK,
               boxShadow: '0 24px 60px rgba(0,0,0,0.5)',
             }}
           >
-            <h2 style={{ margin: 0, fontSize: '1.6rem', lineHeight: 1.15, color: G_INK }}>
+            <h2 style={{ margin: 0, fontSize: narrow ? '1.3rem' : '1.6rem', lineHeight: 1.15, color: G_INK }}>
               {endReason === 'crashed'
                 ? 'Browser crashed'
                 : summary.hits === 0
                   ? 'The mosquitoes won this round'
                   : `${summary.hits} mostquito${summary.hits === 1 ? '' : 'es'}`}
             </h2>
-            <p style={{ margin: '6px 0 18px', color: '#666666', fontSize: '0.95rem' }}>
+            <p style={{ margin: narrow ? '4px 0 12px' : '6px 0 16px', color: '#666666', fontSize: narrow ? '0.88rem' : '0.95rem' }}>
               {endReason === 'crashed'
                 ? `You lasted ${fmtTime(durationMs)} against the swarm.`
-                : `${fmtTime(durationMs)} on the clock, ${summary.shots} shot${summary.shots === 1 ? '' : 's'} fired.`}
-            </p>
-
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10 }}>
-              <ResultCell label="Hits" value={summary.hits} />
-              <ResultCell label="Misses" value={summary.misses} />
-              <ResultCell label="Accuracy" value={`${summary.accuracy}%`} />
-              <ResultCell label="Time played" value={fmtTime(durationMs)} />
-              <ResultCell label="Average reaction" value={fmtMs(summary.avg)} />
-              <ResultCell label="Best reaction" value={fmtMs(summary.best)} />
-            </div>
-
-            {/* Screenshot & Download Section */}
-            <div
-              style={{
-                marginTop: 18,
-                padding: '12px 14px',
-                borderRadius: 10,
-                background: 'rgba(0,0,0,0.05)',
-                fontSize: '0.88rem',
-                color: '#444444',
-                lineHeight: 1.4,
-              }}
-            >
-              📸 <strong>Take a screenshot</strong> of your stats to share on your socials, or download your scorecard image below!
-            </div>
-
-            <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
-              <button
-                type="button"
-                className="ms-btn"
-                onClick={downloadStatsImage}
+                : endReason === 'timeup'
+                  ? `Time's up! ${summary.shots} shot${summary.shots === 1 ? '' : 's'} fired.`
+                  : `${fmtTime(durationMs)} on the clock, ${summary.shots} shot${summary.shots === 1 ? '' : 's'} fired.`}{' '}
+              <span
                 style={{
-                  flex: 1,
-                  padding: '11px 16px',
-                  border: '1px solid #c4c4c4',
-                  borderRadius: 10,
-                  background: '#ffffff',
-                  color: G_INK,
+                  display: 'inline-block',
+                  padding: '1px 9px',
+                  borderRadius: 999,
+                  background: 'rgba(0,0,0,0.08)',
+                  color: '#444444',
+                  fontSize: '0.8em',
                   fontWeight: 700,
-                  fontSize: '0.9rem',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 8,
+                  verticalAlign: 'middle',
+                  whiteSpace: 'nowrap',
                 }}
               >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="7 10 12 15 17 10" />
-                  <line x1="12" y1="15" x2="12" y2="3" />
-                </svg>
-                Download Stats Image
-              </button>
-            </div>
+                {modeLabel}
+              </span>
+            </p>
 
-            <button
-              type="button"
-              className="ms-btn"
-              onClick={playAgain}
+            <div
               style={{
-                marginTop: 18,
-                width: '100%',
-                padding: '13px 18px',
-                border: 'none',
-                borderRadius: 12,
-                background: G_INK,
-                color: '#ffffff',
-                fontWeight: 700,
-                fontSize: '1rem',
+                display: 'grid',
+                gridTemplateColumns: narrow ? '1fr' : '1fr 1fr',
+                gap: narrow ? 12 : 24,
+                alignItems: 'stretch',
               }}
             >
-              Play again
-            </button>
+              <div>
+                <RatingHero rating={rating} compact={narrow} />
+                <Breakdown rating={rating} compact={narrow} />
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: narrow ? 8 : 10 }}>
+                  <ResultCell compact={narrow} label="Hits" value={summary.hits} />
+                  <ResultCell compact={narrow} label="Misses" value={summary.misses} />
+                  <ResultCell compact={narrow} label="Accuracy" value={`${summary.accuracy}%`} />
+                  <ResultCell compact={narrow} label="Time played" value={fmtTime(durationMs)} />
+                  <ResultCell compact={narrow} label="Avg reaction" value={fmtMs(summary.avg)} />
+                  <ResultCell compact={narrow} label="Best reaction" value={fmtMs(summary.best)} />
+                </div>
+
+                <div
+                  style={{
+                    marginTop: narrow ? 10 : 12,
+                    padding: narrow ? '8px 10px' : '10px 14px',
+                    borderRadius: 10,
+                    background: 'rgba(0,0,0,0.05)',
+                    fontSize: narrow ? '0.78rem' : '0.85rem',
+                    color: '#444444',
+                    lineHeight: 1.4,
+                  }}
+                >
+                  📸 <strong>Screenshot your results</strong> to share them, or download the scorecard image.
+                </div>
+
+                <div style={{ display: 'flex', gap: 10, marginTop: narrow ? 10 : 'auto', paddingTop: narrow ? 0 : 12 }}>
+                  <button
+                    type="button"
+                    className="ms-btn"
+                    onClick={downloadStatsImage}
+                    style={{
+                      flex: 1,
+                      padding: narrow ? '11px 10px' : '12px 16px',
+                      border: '1px solid #c4c4c4',
+                      borderRadius: 12,
+                      background: '#ffffff',
+                      color: G_INK,
+                      fontWeight: 700,
+                      fontSize: narrow ? '0.85rem' : '0.95rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 8,
+                    }}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="7 10 12 15 17 10" />
+                      <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                    Download image
+                  </button>
+                  <button
+                    type="button"
+                    className="ms-btn"
+                    onClick={playAgain}
+                    style={{
+                      flex: 1,
+                      padding: narrow ? '11px 10px' : '12px 16px',
+                      border: 'none',
+                      borderRadius: 12,
+                      background: G_INK,
+                      color: '#ffffff',
+                      fontWeight: 700,
+                      fontSize: narrow ? '0.9rem' : '1rem',
+                    }}
+                  >
+                    Play again
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -946,6 +1291,126 @@ const MosquitoShooter = ({ fullscreen = true }) => {
 };
 
 // ─── Small presentational pieces ─────────────────────────────────────────────
+// Game mode chooser shown before the round starts: timed rounds, custom seconds, or Endless
+const ModePicker = ({ mode, onMode, customSec, onCustomSec, narrow }) => {
+  const chip = (active) => ({
+    padding: narrow ? '8px 11px' : '9px 15px',
+    borderRadius: 999,
+    border: `1px solid ${active ? '#ffffff' : G_LINE}`,
+    background: active ? G_TEXT : 'transparent',
+    color: active ? G_INK : G_TEXT,
+    fontWeight: 700,
+    fontSize: narrow ? '0.8rem' : '0.85rem',
+    whiteSpace: 'nowrap',
+  });
+  const options = [
+    { key: 'custom', label: 'Custom' },
+    { key: 'endless', label: 'Endless' },
+  ];
+  const presetActive = MODE_MINUTES.some((m) => String(m) === mode);
+  const arrow = (color) =>
+    `url("data:image/svg+xml;utf8,${encodeURIComponent(
+      `<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1.5l5 5 5-5' fill='none' stroke='${color}' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg>`
+    )}")`;
+  const note =
+    mode === 'endless'
+      ? 'No time limit. The round ends when you stop or the swarm crashes your browser.'
+      : mode === 'custom'
+        ? `Set your own time limit, ${CUSTOM_MIN_SEC} to ${CUSTOM_MAX_SEC} seconds.`
+        : 'The round ends when the timer runs out.';
+  return (
+    <div
+      data-ui
+      role="group"
+      aria-label="Game mode"
+      style={{
+        pointerEvents: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 8,
+        maxWidth: 'calc(100% - 16px)',
+        padding: narrow ? '10px' : '12px 16px',
+        borderRadius: 14,
+        background: G_BG,
+        border: `1px solid ${G_LINE}`,
+        backdropFilter: 'blur(6px)',
+        WebkitBackdropFilter: 'blur(6px)',
+      }}
+    >
+      <div style={{ fontSize: '0.72rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: G_MUTED }}>
+        Game mode
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 8 }}>
+        <select
+          aria-label="Preset time limit"
+          value={presetActive ? mode : ''}
+          onChange={(e) => onMode(e.target.value)}
+          style={{
+            ...chip(presetActive),
+            appearance: 'none',
+            WebkitAppearance: 'none',
+            MozAppearance: 'none',
+            paddingRight: 30,
+            backgroundImage: arrow(presetActive ? G_INK : G_TEXT),
+            backgroundRepeat: 'no-repeat',
+            backgroundPosition: 'right 12px center',
+            backgroundSize: '12px 8px',
+            cursor: 'pointer',
+          }}
+        >
+          <option value="" disabled style={{ background: G_INK, color: '#ffffff' }}>
+            Timed
+          </option>
+          {MODE_MINUTES.map((m) => (
+            <option key={m} value={String(m)} style={{ background: G_INK, color: '#ffffff' }}>
+              {m} min
+            </option>
+          ))}
+        </select>
+        {options.map((o) => (
+          <button
+            key={o.key}
+            type="button"
+            className="ms-btn"
+            aria-pressed={mode === o.key}
+            onClick={() => onMode(o.key)}
+            style={chip(mode === o.key)}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+      {mode === 'custom' && (
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.85rem', color: G_TEXT }}>
+          Seconds
+          <input
+            type="number"
+            inputMode="numeric"
+            min={CUSTOM_MIN_SEC}
+            max={CUSTOM_MAX_SEC}
+            value={customSec}
+            onChange={(e) => onCustomSec(e.target.value)}
+            onBlur={() => onCustomSec(String(clampCustom(customSec)))}
+            style={{
+              width: 84,
+              padding: '7px 10px',
+              borderRadius: 8,
+              border: `1px solid ${G_LINE}`,
+              background: 'rgba(255,255,255,0.1)',
+              color: '#ffffff',
+              fontSize: '0.95rem',
+              fontWeight: 700,
+              textAlign: 'center',
+            }}
+          />
+        </label>
+      )}
+      <div style={{ fontSize: '0.75rem', color: G_MUTED, textAlign: 'center', maxWidth: 340 }}>{note}</div>
+    </div>
+  );
+};
+
 const Stat = ({ label, value }) => (
   <div style={{ textAlign: 'center', minWidth: 46 }}>
     <div style={{ fontSize: '1.2rem', fontWeight: 700, color: '#ffffff', fontVariantNumeric: 'tabular-nums' }}>
@@ -970,10 +1435,70 @@ const Meter = ({ label, value, max }) => {
   );
 };
 
-const ResultCell = ({ label, value }) => (
-  <div style={{ padding: '12px 14px', borderRadius: 10, background: 'rgba(0,0,0,0.07)' }}>
-    <div style={{ fontSize: '1.4rem', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{value}</div>
-    <div style={{ fontSize: '0.8rem', color: '#666666' }}>{label}</div>
+const ResultCell = ({ label, value, compact }) => (
+  <div style={{ padding: compact ? '8px 10px' : '10px 12px', borderRadius: 10, background: 'rgba(0,0,0,0.07)' }}>
+    <div style={{ fontSize: compact ? '1.1rem' : '1.3rem', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{value}</div>
+    <div style={{ fontSize: compact ? '0.72rem' : '0.78rem', color: '#666666' }}>{label}</div>
+  </div>
+);
+
+const RatingHero = ({ rating, compact }) => (
+  <div
+    style={{
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 12,
+      padding: compact ? '12px 14px' : '14px 18px',
+      borderRadius: 12,
+      background: G_INK,
+      color: '#ffffff',
+    }}
+  >
+    <div>
+      <div style={{ fontSize: compact ? '0.78rem' : '0.85rem', color: G_MUTED }}>Total average</div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginTop: 2 }}>
+        <span style={{ fontSize: compact ? '2.3rem' : '2.8rem', fontWeight: 800, lineHeight: 1, fontVariantNumeric: 'tabular-nums' }}>
+          {rating.total}
+        </span>
+        <span style={{ color: G_MUTED, fontWeight: 700 }}>/ 100</span>
+      </div>
+    </div>
+    <div style={{ textAlign: 'right' }}>
+      <div style={{ fontSize: compact ? '2rem' : '2.4rem', fontWeight: 800, lineHeight: 1 }}>{rating.grade}</div>
+      <div style={{ marginTop: 2, fontSize: compact ? '0.8rem' : '0.9rem', color: '#d0d0d0' }}>{rating.title}</div>
+    </div>
+  </div>
+);
+
+const Breakdown = ({ rating, compact }) => (
+  <div
+    style={{
+      marginTop: compact ? 10 : 14,
+      display: 'grid',
+      gridTemplateColumns: compact ? '1fr 1fr' : '1fr',
+      gap: compact ? '8px 14px' : 9,
+    }}
+  >
+    {rating.parts.map((p) => (
+      <div key={p.key}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, fontSize: compact ? '0.72rem' : '0.8rem', color: '#555555' }}>
+          <span>
+            {p.label}
+            {!compact && <span style={{ color: '#888888' }}> ({p.weight}% of total)</span>}
+          </span>
+          <span style={{ fontWeight: 700, color: G_INK, fontVariantNumeric: 'tabular-nums' }}>{p.pct}</span>
+        </div>
+        <div style={{ marginTop: 4, height: 6, borderRadius: 3, background: 'rgba(0,0,0,0.1)', overflow: 'hidden' }}>
+          <div className="ms-grow" style={{ width: `${p.pct}%`, height: '100%', background: G_INK }} />
+        </div>
+      </div>
+    ))}
+    {rating.note && (
+      <div style={{ gridColumn: '1 / -1', fontSize: compact ? '0.72rem' : '0.78rem', color: '#777777' }}>
+        {rating.note}
+      </div>
+    )}
   </div>
 );
 
