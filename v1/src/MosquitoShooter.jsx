@@ -1297,7 +1297,7 @@ const ModePicker = ({ mode, onMode, customSec, onCustomSec, narrow }) => {
     padding: narrow ? '8px 11px' : '9px 15px',
     borderRadius: 999,
     border: `1px solid ${active ? '#ffffff' : G_LINE}`,
-    background: active ? G_TEXT : 'transparent',
+    backgroundColor: active ? G_TEXT : 'transparent',
     color: active ? G_INK : G_TEXT,
     fontWeight: 700,
     fontSize: narrow ? '0.8rem' : '0.85rem',
